@@ -1,11 +1,56 @@
 const SUPABASE_URL = 'https://vokltxbtrastwtttlcpj.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZva2x0eGJ0cmFzdHd0dHRsY3BqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc2NDM4NTAsImV4cCI6MjA5MzIxOTg1MH0.hy37GgFjcWNIsyipdhNgxvu3PcbqFAzihaafzBJOazA';
 
-const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: {
+        storage: window.sessionStorage
+    }
+});
 let currentUser = null;
 
 // FIX 1: Flag untuk mencegah onAuthStateChange bereaksi saat logout manual sedang berjalan
 let isLoggingOut = false;
+
+// ── Handle URL hash dari link email Supabase ────────────────────────────────
+// Deteksi saat halaman pertama kali dibuka via link email reset password
+(function handleUrlHash() {
+    const hash = window.location.hash;
+    if (!hash) return;
+
+    const params = new URLSearchParams(hash.substring(1)); // hapus '#' di awal
+    const errorCode   = params.get('error_code');
+    const errorType   = params.get('error');
+    const type        = params.get('type');
+    const accessToken = params.get('access_token');
+
+    // Kasus 1: Link expired / access_denied
+    if (errorType === 'access_denied' || errorCode === 'otp_expired') {
+        // Tampilkan banner error setelah DOM siap
+        window.addEventListener('DOMContentLoaded', () => {
+            const banner = document.getElementById('banner-expired');
+            if (banner) {
+                banner.classList.remove('hidden');
+                lucide.createIcons();
+            }
+        });
+        // Bersihkan URL agar tidak muncul lagi saat refresh
+        history.replaceState(null, '', window.location.pathname);
+        return;
+    }
+
+    // Kasus 2: Token recovery valid → tampilkan modal ganti password
+    if ((type === 'recovery' || params.get('type') === 'recovery') && accessToken) {
+        window.addEventListener('DOMContentLoaded', () => {
+            const modal = document.getElementById('modal-new-password');
+            if (modal) {
+                modal.classList.remove('hidden');
+                lucide.createIcons();
+            }
+        });
+        // Bersihkan URL
+        history.replaceState(null, '', window.location.pathname);
+    }
+})();
 
 // FIX 2: Flag untuk mencegah loadData dipanggil berkali-kali (race condition)
 let isLoadingData = false;
@@ -115,7 +160,18 @@ function forceResetToAuthScreen() {
     isLoadingData = false;
     isLoggingOut = false;
     data = { finances: [], activities: [], tasks: [] };
+    
+    // Hapus cache dari session dan local (untuk membersihkan sisa lama)
+    sessionStorage.removeItem('alanka_cache');
     localStorage.removeItem('alanka_cache');
+
+    // Bersihkan semua token auth yang mungkin nyangkut di storage
+    Object.keys(localStorage).forEach(key => {
+        if (key.startsWith('sb-')) localStorage.removeItem(key);
+    });
+    Object.keys(sessionStorage).forEach(key => {
+        if (key.startsWith('sb-')) sessionStorage.removeItem(key);
+    });
 
     document.getElementById('auth-screen').classList.remove('hidden');
     document.getElementById('app-container').classList.add('hidden');
@@ -136,18 +192,7 @@ sb.auth.onAuthStateChange(async (event, session) => {
     const appContent = document.getElementById('app-content');
 
     if (event === 'SIGNED_OUT' || !session || !session.user) {
-        // Reset flag logout
-        isLoggingOut = false;
-        isLoadingData = false;
-
-        // Reset state
-        currentUser = null;
-        data = { finances: [], activities: [], tasks: [] };
-        localStorage.removeItem('alanka_cache');
-
-        // Tampilkan auth screen
-        authScreen.classList.remove('hidden');
-        appContainer.classList.add('hidden');
+        forceResetToAuthScreen();
         return;
     }
 
@@ -164,7 +209,7 @@ sb.auth.onAuthStateChange(async (event, session) => {
     appContainer.classList.remove('hidden');
 
     // Tampilkan dari cache agar instan
-    const cachedData = localStorage.getItem('alanka_cache');
+    const cachedData = sessionStorage.getItem('alanka_cache');
     if (cachedData) {
         try {
             data = JSON.parse(cachedData);
@@ -208,6 +253,9 @@ async function loadData() {
             sb.from('activities').select('*').order('created_at', { ascending: false }),
             sb.from('tasks').select('*').order('deadline', { ascending: true })
         ]);
+
+        // FIX: Cegah overwrite cache jika user logout selagi menunggu response server
+        if (!currentUser) return;
 
         if (!finRes.error) data.finances = finRes.data || [];
         if (!actRes.error) data.activities = actRes.data || [];
@@ -342,8 +390,12 @@ document.getElementById('finance-form').addEventListener('submit', async (e) => 
         if (error) {
             alert("Gagal menyimpan: " + error.message + "\n\nPastikan tabel 'finances' sudah dibuat di Supabase dan RLS policy sudah diatur.");
         } else {
-            data.finances.unshift(inserted[0]);
-            localStorage.setItem('alanka_cache', JSON.stringify(data));
+            if (inserted && inserted.length > 0) {
+                data.finances.unshift(inserted[0]);
+            } else {
+                loadData(); // Fallback fetch
+            }
+            sessionStorage.setItem('alanka_cache', JSON.stringify(data));
             showToast("Transaksi disimpan!");
             document.getElementById('fin_amount').value = '';
             document.getElementById('fin_note').value = '';
@@ -477,8 +529,12 @@ document.getElementById('activity-form').addEventListener('submit', async (e) =>
         if (error) {
             alert("Gagal menyimpan: " + error.message + "\n\nPastikan tabel 'activities' sudah dibuat di Supabase dan RLS policy sudah diatur.");
         } else {
-            data.activities.unshift(inserted[0]);
-            localStorage.setItem('alanka_cache', JSON.stringify(data));
+            if (inserted && inserted.length > 0) {
+                data.activities.unshift(inserted[0]);
+            } else {
+                loadData(); // Fallback fetch
+            }
+            sessionStorage.setItem('alanka_cache', JSON.stringify(data));
             showToast("Catatan disimpan!");
             document.getElementById('act_content').value = '';
             document.getElementById('act_tags').value = '';
@@ -584,8 +640,12 @@ document.getElementById('task-form').addEventListener('submit', async (e) => {
         if (error) {
             alert("Gagal menyimpan: " + error.message + "\n\nPastikan tabel 'tasks' sudah dibuat di Supabase dan RLS policy sudah diatur.");
         } else {
-            data.tasks.push(inserted[0]);
-            localStorage.setItem('alanka_cache', JSON.stringify(data));
+            if (inserted && inserted.length > 0) {
+                data.tasks.push(inserted[0]);
+            } else {
+                loadData(); // Fallback fetch
+            }
+            sessionStorage.setItem('alanka_cache', JSON.stringify(data));
             showToast("Tugas ditambahkan!");
             document.getElementById('tsk_title').value = '';
             document.getElementById('tsk_desc').value = '';
@@ -600,29 +660,85 @@ document.getElementById('task-form').addEventListener('submit', async (e) => {
 });
 
 async function toggleTask(id) {
-    const task = data.tasks.find(t => t.id === id);
-    if (task) {
-        const newVal = !task.is_done;
+    if (!currentUser) return;
+    // FIX: Bandingkan sebagai string agar tidak gagal karena type mismatch (number vs string)
+    const task = data.tasks.find(t => String(t.id) === String(id));
+    if (!task) return;
+    const newVal = !task.is_done;
+    try {
         const { error } = await sb.from('tasks').update({ is_done: newVal }).eq('id', id);
         if (!error) {
             task.is_done = newVal;
+            sessionStorage.setItem('alanka_cache', JSON.stringify(data));
             renderTasks();
         } else {
             alert("Error updating: " + error.message);
         }
+    } catch(err) {
+        console.error('toggleTask error:', err);
     }
 }
 
 async function deleteTask(id) {
+    if (!currentUser) return;
     if (confirm("Hapus tugas ini?")) {
-        const { error } = await sb.from('tasks').delete().eq('id', id);
-        if (!error) {
-            data.tasks = data.tasks.filter(t => t.id !== id);
-            renderTasks();
-        } else {
-            alert("Error deleting: " + error.message);
+        try {
+            const { error } = await sb.from('tasks').delete().eq('id', id);
+            if (!error) {
+                // FIX: Bandingkan sebagai string
+                data.tasks = data.tasks.filter(t => String(t.id) !== String(id));
+                sessionStorage.setItem('alanka_cache', JSON.stringify(data));
+                renderTasks();
+            } else {
+                alert("Error deleting: " + error.message);
+            }
+        } catch(err) {
+            console.error('deleteTask error:', err);
         }
     }
+}
+
+function createTaskElement(t, forDash = false) {
+    const priorityColors = {
+        'High': 'text-red-600 bg-red-50',
+        'Medium': 'text-yellow-600 bg-yellow-50',
+        'Low': 'text-indigo-600 bg-indigo-50'
+    };
+    const pClass = priorityColors[t.priority] || 'text-gray-600 bg-gray-50';
+
+    // FIX: Gunakan createElement agar event handler tidak mati karena innerHTML +=
+    const wrapper = document.createElement('div');
+    wrapper.className = `flex items-start gap-3 bg-white p-3 md:p-4 rounded-xl border border-gray-100 ${t.is_done ? 'opacity-70 bg-gray-50' : 'shadow-sm'} transition hover:border-indigo-100`;
+
+    // Checkbox
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = t.is_done;
+    checkbox.className = 'mt-1 w-5 h-5 text-indigo-600 rounded-md focus:ring-indigo-500 cursor-pointer';
+    checkbox.addEventListener('change', () => toggleTask(t.id));
+    wrapper.appendChild(checkbox);
+
+    // Content
+    const content = document.createElement('div');
+    content.className = 'flex-1 min-w-0';
+    content.innerHTML = `
+        <p class="font-medium truncate ${t.is_done ? 'line-through text-gray-500' : 'text-gray-800'}">${t.title}</p>
+        ${t.desc ? `<p class="text-sm text-gray-500 mt-1 whitespace-pre-wrap">${t.desc}</p>` : ''}
+        <div class="flex gap-2 text-xs mt-2">
+            <span class="text-gray-500 flex items-center gap-1"><i data-lucide="calendar" class="w-3 h-3"></i> ${t.deadline}</span>
+            <span class="px-2 py-0.5 rounded-md font-medium ${pClass}">${t.priority}</span>
+        </div>
+    `;
+    wrapper.appendChild(content);
+
+    // Delete button
+    const delBtn = document.createElement('button');
+    delBtn.className = 'text-red-400 hover:text-red-600 p-2 mt-[-4px]';
+    delBtn.innerHTML = '<i data-lucide="trash-2" class="w-4 h-4"></i>';
+    delBtn.addEventListener('click', () => deleteTask(t.id));
+    wrapper.appendChild(delBtn);
+
+    return wrapper;
 }
 
 function renderTasks() {
@@ -644,38 +760,13 @@ function renderTasks() {
     let pendingCount = 0;
 
     sorted.forEach(t => {
-        const priorityColors = {
-            'High': 'text-red-600 bg-red-50',
-            'Medium': 'text-yellow-600 bg-yellow-50',
-            'Low': 'text-indigo-600 bg-indigo-50'
-        };
-        const pClass = priorityColors[t.priority];
-
-        let descHtml = t.desc ? `<p class="text-sm text-gray-500 mt-1 whitespace-pre-wrap">${t.desc}</p>` : '';
-
-        const html = `
-            <div class="flex items-start gap-3 bg-white p-3 md:p-4 rounded-xl border border-gray-100 ${t.is_done ? 'opacity-70 bg-gray-50' : 'shadow-sm'} transition hover:border-indigo-100">
-                <input type="checkbox" ${t.is_done ? 'checked' : ''} onchange="toggleTask('${t.id}')" class="mt-1 w-5 h-5 text-indigo-600 rounded-md focus:ring-indigo-500 cursor-pointer">
-                <div class="flex-1 min-w-0">
-                    <p class="font-medium truncate ${t.is_done ? 'line-through text-gray-500' : 'text-gray-800'}">${t.title}</p>
-                    ${descHtml}
-                    <div class="flex gap-2 text-xs mt-2">
-                        <span class="text-gray-500 flex items-center gap-1"><i data-lucide="calendar" class="w-3 h-3"></i> ${t.deadline}</span>
-                        <span class="px-2 py-0.5 rounded-md font-medium ${pClass}">${t.priority}</span>
-                    </div>
-                </div>
-                <button onclick="deleteTask('${t.id}')" class="text-red-400 hover:text-red-600 p-2 mt-[-4px]"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
-            </div>
-        `;
-
         if (t.is_done) {
-            listCompleted.innerHTML += html;
+            listCompleted.appendChild(createTaskElement(t));
         } else {
-            listPending.innerHTML += html;
+            listPending.appendChild(createTaskElement(t));
             pendingCount++;
-
             if (pendingCount <= 4) {
-                dashList.innerHTML += html;
+                dashList.appendChild(createTaskElement(t));
             }
         }
     });
@@ -708,3 +799,134 @@ document.addEventListener('DOMContentLoaded', () => {
 
 document.getElementById('act_search').addEventListener('input', renderActivities);
 document.getElementById('act_filter_date').addEventListener('change', renderActivities);
+
+// ── Reset Password ──────────────────────────────────────────────────────────
+const modalReset    = document.getElementById('modal-reset');
+const btnForgot     = document.getElementById('btn-forgot');
+const btnCloseReset = document.getElementById('btn-close-reset');
+const btnSendReset  = document.getElementById('btn-send-reset');
+const resetEmail    = document.getElementById('reset-email');
+const resetMsg      = document.getElementById('reset-msg');
+
+function openResetModal() {
+    resetEmail.value = '';
+    resetMsg.classList.add('hidden');
+    resetMsg.innerText = '';
+    modalReset.classList.remove('hidden');
+    lucide.createIcons();
+}
+
+function closeResetModal() {
+    modalReset.classList.add('hidden');
+}
+
+btnForgot.addEventListener('click', openResetModal);
+btnCloseReset.addEventListener('click', closeResetModal);
+
+// Tutup modal jika klik di luar konten
+modalReset.addEventListener('click', (e) => {
+    if (e.target === modalReset) closeResetModal();
+});
+
+btnSendReset.addEventListener('click', async () => {
+    const email = resetEmail.value.trim();
+    if (!email) {
+        resetMsg.innerText = 'Masukkan email Anda terlebih dahulu.';
+        resetMsg.className = 'text-center text-sm text-red-500';
+        resetMsg.classList.remove('hidden');
+        return;
+    }
+
+    btnSendReset.innerText = 'Mengirim...';
+    btnSendReset.disabled  = true;
+
+    try {
+        const { error } = await sb.auth.resetPasswordForEmail(email, {
+            redirectTo: window.location.href   // arahkan kembali ke app ini
+        });
+
+        if (error) {
+            resetMsg.innerText = 'Gagal: ' + error.message;
+            resetMsg.className = 'text-center text-sm text-red-500';
+        } else {
+            resetMsg.innerText = '✅ Link reset password berhasil dikirim! Silakan cek inbox email Anda (termasuk folder Spam).';
+            resetMsg.className = 'text-center text-sm text-green-600';
+            resetEmail.value   = '';
+        }
+    } catch (err) {
+        resetMsg.innerText = 'Terjadi kesalahan. Periksa koneksi internet Anda.';
+        resetMsg.className = 'text-center text-sm text-red-500';
+    } finally {
+        resetMsg.classList.remove('hidden');
+        btnSendReset.innerText = 'Kirim Link Reset';
+        btnSendReset.disabled  = false;
+    }
+});
+
+// ── Handler Simpan Password Baru ─────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    const btnUpdatePw  = document.getElementById('btn-update-password');
+    const newPwInput   = document.getElementById('new-password-input');
+    const newPwConfirm = document.getElementById('new-password-confirm');
+    const newPwMsg     = document.getElementById('new-password-msg');
+    const modalNewPw   = document.getElementById('modal-new-password');
+
+    if (!btnUpdatePw) return;
+
+    btnUpdatePw.addEventListener('click', async () => {
+        const pw1 = newPwInput.value.trim();
+        const pw2 = newPwConfirm.value.trim();
+
+        newPwMsg.classList.add('hidden');
+
+        if (!pw1 || !pw2) {
+            newPwMsg.innerText = 'Harap isi kedua kolom password.';
+            newPwMsg.className = 'text-center text-sm text-red-500';
+            newPwMsg.classList.remove('hidden');
+            return;
+        }
+
+        if (pw1 !== pw2) {
+            newPwMsg.innerText = 'Password dan konfirmasi tidak cocok.';
+            newPwMsg.className = 'text-center text-sm text-red-500';
+            newPwMsg.classList.remove('hidden');
+            return;
+        }
+
+        if (pw1.length < 6) {
+            newPwMsg.innerText = 'Password minimal 6 karakter.';
+            newPwMsg.className = 'text-center text-sm text-red-500';
+            newPwMsg.classList.remove('hidden');
+            return;
+        }
+
+        btnUpdatePw.innerText = 'Menyimpan...';
+        btnUpdatePw.disabled  = true;
+
+        try {
+            const { error } = await sb.auth.updateUser({ password: pw1 });
+
+            if (error) {
+                newPwMsg.innerText = 'Gagal: ' + error.message;
+                newPwMsg.className = 'text-center text-sm text-red-500';
+            } else {
+                newPwMsg.innerText = '✅ Password berhasil diperbarui! Silakan login dengan password baru Anda.';
+                newPwMsg.className = 'text-center text-sm text-green-600';
+                newPwInput.value   = '';
+                newPwConfirm.value = '';
+                // Tutup modal & logout setelah 2 detik agar user login ulang
+                setTimeout(() => {
+                    modalNewPw.classList.add('hidden');
+                    logout();
+                }, 2000);
+            }
+        } catch (err) {
+            newPwMsg.innerText = 'Terjadi kesalahan jaringan.';
+            newPwMsg.className = 'text-center text-sm text-red-500';
+        } finally {
+            newPwMsg.classList.remove('hidden');
+            btnUpdatePw.innerText = 'Simpan Password Baru';
+            btnUpdatePw.disabled  = false;
+        }
+    });
+});
